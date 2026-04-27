@@ -969,61 +969,88 @@ async function signOut(){
 
 // ─── DB LAYER ───────────────────────────────────
 async function dbLoadAll(){
-  // Load journals
-  const {data:jRows, error:jErr} = await sb.from('journals').select('*').eq('user_id', currentUser.id);
+  // Load journals for the logged-in user. RLS also protects this, the filter is just explicit.
+  const {data:jRows, error:jErr} = await sb
+    .from('journals')
+    .select('*')
+    .eq('user_id', currentUser.id)
+    .order('created_at', { ascending: true });
   if(jErr) throw jErr;
-  // Load trades
-  const {data:tRows, error:tErr} = await sb.from('trades').select('*').eq('user_id', currentUser.id);
+
+  // Load trades. There is intentionally NO user_id column on trades.
+  // Access is controlled through trades.journal_id -> journals.user_id by RLS.
+  const {data:tRows, error:tErr} = await sb
+    .from('trades')
+    .select('*')
+    .order('created_at', { ascending: true });
   if(tErr) throw tErr;
+
   // Rebuild state
   state.journals = {};
   if(!jRows || jRows.length===0){
-    // First login — create default journal
-    const id = genId();
-    await sb.from('journals').insert({id, user_id:currentUser.id, name:'Live Journal'});
-    state.journals[id] = {name:'Live Journal', trades:[]};
-    state.activeJournal = id;
+    // First login — create default journal and use the UUID returned by Supabase.
+    const {data:newJournal, error:createErr} = await sb
+      .from('journals')
+      .insert({ user_id: currentUser.id, name:'Live Journal' })
+      .select()
+      .single();
+    if(createErr) throw createErr;
+
+    state.journals[newJournal.id] = {name:newJournal.name, trades:[]};
+    state.activeJournal = newJournal.id;
   } else {
     jRows.forEach(j=>{ state.journals[j.id] = {name:j.name, trades:[]}; });
     if(!state.activeJournal || !state.journals[state.activeJournal]){
       state.activeJournal = jRows[0].id;
     }
   }
+
   if(tRows){
     tRows.forEach(t=>{
       if(state.journals[t.journal_id]){
-        state.journals[t.journal_id].trades.push(t.data);
+        const tradeData = {...(t.data || {}), id: t.id};
+        state.journals[t.journal_id].trades.push(tradeData);
       }
     });
   }
 }
 
 async function dbSaveTrade(trade){
+  if(!state.activeJournal) throw new Error('Kein aktives Journal ausgewählt.');
+  const cleanTrade = {...trade, id: trade.id || genId()};
+
   const {error} = await sb.from('trades').upsert({
-    id: trade.id,
-    user_id: currentUser.id,
+    id: cleanTrade.id,
     journal_id: state.activeJournal,
-    data: trade
+    data: cleanTrade
   }, {onConflict:'id'});
   if(error) throw error;
 }
 
 async function dbDeleteTrade(tradeId){
-  const {error} = await sb.from('trades').delete().eq('id', tradeId).eq('user_id', currentUser.id);
+  const {error} = await sb.from('trades').delete().eq('id', tradeId);
   if(error) throw error;
 }
 
-async function dbSaveJournal(id, name){
-  const {error} = await sb.from('journals').upsert({
-    id, user_id:currentUser.id, name
-  }, {onConflict:'id'});
+async function dbCreateJournal(name){
+  const {data, error} = await sb
+    .from('journals')
+    .insert({ user_id: currentUser.id, name })
+    .select()
+    .single();
+  if(error) throw error;
+  return data;
+}
+
+async function dbRenameJournal(id, name){
+  const {error} = await sb.from('journals').update({ name }).eq('id', id);
   if(error) throw error;
 }
 
 async function dbDeleteJournal(id){
-  // Delete all trades in journal first
-  await sb.from('trades').delete().eq('journal_id', id).eq('user_id', currentUser.id);
-  await sb.from('journals').delete().eq('id', id).eq('user_id', currentUser.id);
+  // Trades are deleted automatically by ON DELETE CASCADE.
+  const {error} = await sb.from('journals').delete().eq('id', id);
+  if(error) throw error;
 }
 
 // ─── SAVE (async wrapper) ────────────────────────
@@ -1044,7 +1071,7 @@ async function deleteTrade(tradeId){
 }
 
 // ─── UTILS ──────────────────────────────────────
-function genId(){ return Date.now().toString(36)+Math.random().toString(36).slice(2); }
+function genId(){ return crypto.randomUUID ? crypto.randomUUID() : ([1e7]+-1e3+-4e3+-8e3+-1e11).replace(/[018]/g,c=>(c ^ crypto.getRandomValues(new Uint8Array(1))[0] & 15 >> c / 4).toString(16)); }
 function fmtDate(dt){
   if(!dt) return '—';
   const d = new Date(dt);
@@ -1132,7 +1159,7 @@ function applyTheme(){
   if(state.theme==='dark'){ track.classList.add('on'); label.textContent='🌙 Dark'; }
   else { track.classList.remove('on'); label.textContent='☀️ Light'; }
 }
-function toggleTheme(){ state.theme=state.theme==='dark'?'light':'dark'; applyTheme(); save(); }
+function toggleTheme(){ state.theme=state.theme==='dark'?'light':'dark'; applyTheme(); syncTheme(); }
 
 // ─── NAVIGATION ─────────────────────────────────
 function navigate(view){
@@ -1185,14 +1212,22 @@ async function deleteJournalPrompt(){
 async function confirmJournalAction(){
   const name=document.getElementById('journalNameInput').value.trim();
   if(!name){ toast('Name fehlt','error'); return; }
-  if(journalModalMode==='new'){
-    const id=genId(); state.journals[id]={name,trades:[]}; state.activeJournal=id; toast('Erstellt: '+name);
-    try { await dbSaveJournal(id, name); } catch(e){ toast('Sync-Fehler','error'); }
-  } else {
-    state.journals[state.activeJournal].name=name; toast('Umbenannt: '+name);
-    try { await dbSaveJournal(state.activeJournal, name); } catch(e){ toast('Sync-Fehler','error'); }
+
+  try {
+    if(journalModalMode==='new'){
+      const journal = await dbCreateJournal(name);
+      state.journals[journal.id] = {name: journal.name, trades:[]};
+      state.activeJournal = journal.id;
+      toast('Erstellt: '+journal.name);
+    } else {
+      await dbRenameJournal(state.activeJournal, name);
+      state.journals[state.activeJournal].name = name;
+      toast('Umbenannt: '+name);
+    }
+    renderJournalSelect(); closeModal('journalModal'); navigate('dashboard');
+  } catch(e){
+    toast('Sync-Fehler: '+e.message,'error');
   }
-  renderJournalSelect(); closeModal('journalModal'); navigate('dashboard');
 }
 
 // ─── FORM ────────────────────────────────────────
